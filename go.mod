@@ -1,4 +1,4 @@
-module github.com/apexracing/golang-audio-player
+module github.com/apexracing/tracklogic-audio
 
 go 1.25.3
 

@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"strconv"
 
-	"github.com/apexracing/golang-audio-player/audio"
+	"github.com/apexracing/tracklogic-audio/audio"
 )
 
 func main() {
