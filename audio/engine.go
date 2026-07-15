@@ -11,7 +11,7 @@ import (
 	"github.com/gen2brain/malgo"
 )
 
-// DeviceInfo represents an audio playback device.
+// DeviceInfo represents an audio playback or capture device.
 type DeviceInfo struct {
 	ID        string
 	Name      string
@@ -26,8 +26,9 @@ type preloadedSound struct {
 	sampleRate    uint32
 }
 
-// AudioPlayerEngine manages the audio context lifecycle and caches preloaded sounds
-// and their Players for low-latency repeated playback.
+// AudioPlayerEngine manages the shared audio context, cached playback sounds,
+// Players, and Recorders. The name is retained for backward compatibility;
+// new code that uses capture may prefer the AudioEngine alias.
 //
 // Typical usage:
 //
@@ -36,15 +37,20 @@ type preloadedSound struct {
 //	engine.Preload("beep", "beep.wav")
 //	engine.PlaySound("beep", "") // play on default device
 type AudioPlayerEngine struct {
-	ctx     *malgo.AllocatedContext
-	sounds  map[string]*preloadedSound // name → decoded PCM
-	cache   map[string]*Player         // "name|deviceID" → Player
-	players []*Player                  // all Players for cleanup
+	ctx       *malgo.AllocatedContext
+	sounds    map[string]*preloadedSound // name → decoded PCM
+	cache     map[string]*Player         // "name|deviceID" → Player
+	players   []*Player                  // all Players for cleanup
+	recorders map[*Recorder]struct{}     // all Recorders for cleanup
 
 	masterVolume atomic.Uint32 // float32 bits, 1.0 = full volume
 	masterGain   atomic.Uint32 // float32 bits, 1.0 = unity gain
 	mu           sync.Mutex
 }
+
+// AudioEngine is the preferred name when an engine is used for both
+// playback and capture. AudioPlayerEngine remains fully compatible.
+type AudioEngine = AudioPlayerEngine
 
 // Init initializes the audio backend. Must be called first.
 func (e *AudioPlayerEngine) Init() error {
@@ -62,17 +68,21 @@ func (e *AudioPlayerEngine) Init() error {
 	e.ctx = ctx
 	e.sounds = make(map[string]*preloadedSound)
 	e.cache = make(map[string]*Player)
+	e.recorders = make(map[*Recorder]struct{})
 	e.masterVolume.Store(math.Float32bits(1.0))
 	e.masterGain.Store(math.Float32bits(1.0))
 	return nil
 }
 
-// Destroy stops and closes all Players, then releases the audio backend.
+// Destroy stops and closes all Players and Recorders, then releases the audio backend.
 func (e *AudioPlayerEngine) Destroy() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.ctx == nil {
 		return nil
+	}
+	for recorder := range e.recorders {
+		_ = recorder.close()
 	}
 	for _, p := range e.players {
 		p.device.Stop()
@@ -81,6 +91,7 @@ func (e *AudioPlayerEngine) Destroy() error {
 	e.players = nil
 	e.cache = nil
 	e.sounds = nil
+	e.recorders = nil
 	e.ctx.Uninit()
 	e.ctx.Free()
 	e.ctx = nil
@@ -94,7 +105,17 @@ func (e *AudioPlayerEngine) ListDevices() ([]DeviceInfo, error) {
 	if e.ctx == nil {
 		return nil, ErrNotInitialized
 	}
-	return listDevicesWithCtx(e.ctx)
+	return listDevicesWithCtx(e.ctx, malgo.Playback)
+}
+
+// ListCaptureDevices returns all available audio input devices.
+func (e *AudioPlayerEngine) ListCaptureDevices() ([]DeviceInfo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return nil, ErrNotInitialized
+	}
+	return listDevicesWithCtx(e.ctx, malgo.Capture)
 }
 
 // Preload decodes a WAV file and caches the PCM data in memory under the given name.
@@ -199,8 +220,8 @@ func (e *AudioPlayerEngine) MasterGain() float64 {
 
 // --- internal ---
 
-func listDevicesWithCtx(ctx *malgo.AllocatedContext) ([]DeviceInfo, error) {
-	devices, err := ctx.Devices(malgo.Playback)
+func listDevicesWithCtx(ctx *malgo.AllocatedContext, kind malgo.DeviceType) ([]DeviceInfo, error) {
+	devices, err := ctx.Devices(kind)
 	if err != nil {
 		return nil, err
 	}

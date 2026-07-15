@@ -2,7 +2,7 @@
 
 ## Project overview
 
-Go audio playback library & CLI built on [miniaudio](https://miniaud.io/) via Go CGO bindings [malgo](https://github.com/gen2brain/malgo). Supports WAV (PCM) playback, device enumeration, and low-latency notification sound replay.
+Go audio playback and capture library built on [miniaudio](https://miniaud.io/) via Go CGO bindings [malgo](https://github.com/gen2brain/malgo). Supports WAV (PCM) playback, playback/capture device enumeration, low-latency notification sound replay, and in-memory microphone recording for `tracklogic-asr`.
 
 ## Build & run
 
@@ -19,30 +19,63 @@ go run main.go play <wav> [deviceID]  # play a WAV file
 ## Architecture
 
 ```
-audio/          ← reusable package (import by third-party Go programs)
-  device.go     → DeviceInfo, ListDevices() standalone convenience
-  engine.go     → AudioPlayerEngine: Init/Destroy, Preload, PlaySound, NewPlayer, ListDevices
-  player.go     → Player: Play/Stop/Close/Reset/Replay/Done, WAV header parsing (stdlib encoding/binary)
-  errors.go     → ErrNotInitialized
-main.go          ← CLI demo
+audio/
+  engine.go      → shared context, device enumeration, playback cache
+  player.go      → WAV playback and Player lifecycle
+  recorder.go    → capture configuration, Recorder, and Recording
+  errors.go      → public lifecycle errors
+main.go          → playback CLI demo
 ```
 
 ### Package API
 
-**Standalone (simple, one-shot):**
+**Engine (shared context):**
 ```go
-devices, _ := audio.ListDevices()
-player, _ := audio.NewPlayer("file.wav", "")  // "" = default device
-player.Play()
-<-player.Done()
-player.Close()
+var engine audio.AudioEngine
+if err := engine.Init(); err != nil {
+    log.Fatal(err)
+}
+defer engine.Destroy()
 ```
 
-**Engine (shared context, sound caching, low-latency replay):**
+**List input devices and record an ASR-ready segment:**
+
 ```go
-var engine audio.AudioPlayerEngine
-engine.Init()
-defer engine.Destroy()
+devices, err := engine.ListCaptureDevices()
+if err != nil {
+    log.Fatal(err)
+}
+for _, device := range devices {
+    fmt.Printf("%s  %s  default=%v\n", device.ID, device.Name, device.IsDefault)
+}
+
+recorder, err := engine.NewRecorder(audio.RecorderConfig{
+    DeviceID:   "",    // empty selects the system default input
+    SampleRate: 16000, // zero also defaults to 16 kHz
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer recorder.Close()
+
+if err = recorder.Start(); err != nil {
+    log.Fatal(err)
+}
+// Record until the application decides the utterance is complete.
+recording, err := recorder.Stop()
+if err != nil {
+    log.Fatal(err)
+}
+
+// tracklogic-asr accepts this data directly:
+result, err := recognizer.Transcribe(ctx, recording.Samples, recording.SampleRate, asr.Options{})
+```
+
+Capture output is always mono `float32` PCM. Each `Start` begins a fresh segment; `Stop` returns a copy that remains valid across later recordings. Because a complete segment is buffered in memory, callers should stop recordings at an application-defined duration.
+
+**Cached playback:**
+
+```go
 
 engine.Preload("beep", "beep.wav")           // decode once, cache PCM
 player, _ := engine.PlaySound("beep", "")    // 1st call: init device + play
@@ -64,6 +97,6 @@ Parses standard PCM WAV headers via `encoding/binary` (no external dependency). 
 
 ### Engine lifecycle
 
-- `Engine.Destroy()` closes all Players (both cached and standalone) before freeing the malgo context
+- `Engine.Destroy()` closes all Players and Recorders before freeing the malgo context
 - The `"name|deviceID"` cache key means: same sound on different devices → separate cached Players
-- Context is shared across all Players from the same Engine
+- Context is shared across Players and Recorders from the same Engine

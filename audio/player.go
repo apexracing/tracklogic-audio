@@ -57,7 +57,7 @@ func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, device
 	deviceConfig.SampleRate = snd.sampleRate
 
 	if deviceID != "" {
-		rawID, err := resolveDeviceID(ctx, deviceID)
+		rawID, err := resolveDeviceID(ctx, malgo.Playback, deviceID)
 		if err != nil {
 			return nil, err
 		}
@@ -393,8 +393,8 @@ func toMalgoFormat(bitsPerSample uint16) (malgo.FormatType, error) {
 	}
 }
 
-func resolveDeviceID(ctx *malgo.AllocatedContext, hexID string) (malgo.DeviceID, error) {
-	devices, err := ctx.Devices(malgo.Playback)
+func resolveDeviceID(ctx *malgo.AllocatedContext, kind malgo.DeviceType, hexID string) (malgo.DeviceID, error) {
+	devices, err := ctx.Devices(kind)
 	if err != nil {
 		return malgo.DeviceID{}, err
 	}
