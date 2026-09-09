@@ -34,10 +34,21 @@ type Player struct {
 	device *malgo.Device
 	ctx    *malgo.AllocatedContext
 
-	pcmData        []byte
-	pos            int
-	gen            atomic.Int64 // incremented on Reset/Replay, prevents stale callbacks
-	bytesPerSample int          // 1, 2, 3, or 4
+	pcmData []byte
+	// positionFrames is the playback cursor in source frames.
+	positionFrames float64
+	// gen is incremented on Reset/Replay, prevents stale callbacks.
+	gen atomic.Int64
+
+	// playbackRate uses atomic float32 bits, 1.0 means normal speed.
+	playbackRate atomic.Uint32
+	loop         atomic.Bool
+
+	numChannels    int
+	sampleRate     uint32
+	bytesPerSample int
+	bytesPerFrame  int
+	sourceFrames   int
 
 	volume atomic.Uint32 // float32 bits, 1.0 = full volume
 	gain   atomic.Uint32 // float32 bits, 1.0 = unity gain, >1.0 amplifies
@@ -64,14 +75,27 @@ func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, device
 		deviceConfig.Playback.DeviceID = rawID.Pointer()
 	}
 
+	numChannels := int(snd.numChannels)
+	bytesPerSample := int(snd.bitsPerSample / 8)
+	bytesPerFrame := numChannels * bytesPerSample
+	sourceFrames := 0
+	if bytesPerFrame > 0 {
+		sourceFrames = len(snd.pcmData) / bytesPerFrame
+	}
+
 	p := &Player{
 		ctx:            ctx,
 		pcmData:        snd.pcmData,
 		done:           make(chan struct{}),
-		bytesPerSample: int(snd.bitsPerSample / 8),
+		numChannels:    numChannels,
+		sampleRate:     snd.sampleRate,
+		bytesPerSample: bytesPerSample,
+		bytesPerFrame:  bytesPerFrame,
+		sourceFrames:   sourceFrames,
 	}
 	p.volume.Store(math.Float32bits(1.0))
 	p.gain.Store(math.Float32bits(1.0))
+	p.playbackRate.Store(math.Float32bits(1.0))
 
 	callbacks := malgo.DeviceCallbacks{
 		Data: p.dataCallback,
@@ -106,7 +130,7 @@ func (p *Player) Reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.gen.Add(1)
-	p.pos = 0
+	p.positionFrames = 0
 	p.done = make(chan struct{})
 }
 
@@ -120,7 +144,7 @@ func (p *Player) Replay() error {
 		}
 	}
 	p.gen.Add(1)
-	p.pos = 0
+	p.positionFrames = 0
 	p.done = make(chan struct{})
 	return p.device.Start()
 }
@@ -170,12 +194,59 @@ func (p *Player) Gain() float64 {
 	return float64(math.Float32frombits(p.gain.Load()))
 }
 
+// SetLoop sets whether the player should keep looping.
+func (p *Player) SetLoop(enabled bool) {
+	p.loop.Store(enabled)
+}
+
+// Loop reports whether loop playback is enabled.
+func (p *Player) Loop() bool {
+	return p.loop.Load()
+}
+
+// SetPlaybackRate updates playback rate and pitch.
+//
+// Clamps to [0.25, 4.0] for safety.
+func (p *Player) SetPlaybackRate(rate float64) {
+	if rate < 0.25 || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		rate = 0.25
+	}
+	if rate > 4.0 {
+		rate = 4.0
+	}
+	p.playbackRate.Store(math.Float32bits(float32(rate)))
+}
+
+// PlaybackRate returns current playback rate.
+func (p *Player) PlaybackRate() float64 {
+	return float64(math.Float32frombits(p.playbackRate.Load()))
+}
+
 // --- internal ---
 
 func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	gen := p.gen.Load()
-	if p.pos >= len(p.pcmData) {
-		for i := range pOutput {
+	loop := p.loop.Load()
+	rate := p.playbackRateValue()
+	if len(pOutput) == 0 {
+		return
+	}
+
+	maxFramesByBuffer := len(pOutput) / maxInt(1, p.bytesPerFrame)
+	requestedFrames := int(frameCount)
+	if requestedFrames > maxFramesByBuffer {
+		requestedFrames = maxFramesByBuffer
+	}
+	if requestedFrames <= 0 {
+		return
+	}
+	requestedBytes := requestedFrames * p.bytesPerFrame
+
+	if p.sourceFrames <= 0 || p.bytesPerFrame == 0 {
+		for i := 0; i < requestedBytes; i++ {
 			pOutput[i] = 0
 		}
 		if p.gen.Load() == gen {
@@ -185,83 +256,117 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 				close(p.done)
 			}
 		}
+		for i := requestedBytes; i < len(pOutput); i++ {
+			pOutput[i] = 0
+		}
 		return
 	}
-
-	n := copy(pOutput, p.pcmData[p.pos:])
-	p.pos += n
 
 	vol := math.Float32frombits(p.volume.Load())
 	gn := math.Float32frombits(p.gain.Load())
 	effective := float64(vol) * float64(gn)
-	if effective != 1.0 {
-		switch p.bytesPerSample {
-		case 1: // u8: unsigned 8-bit, center=128
-			for i := 0; i < n; i++ {
-				centered := int32(pOutput[i]) - 128
-				scaled := int32(float64(centered) * effective)
-				if scaled > 127 {
-					scaled = 127
-				} else if scaled < -128 {
-					scaled = -128
-				}
-				pOutput[i] = uint8(scaled + 128)
-			}
-		case 2: // s16: signed 16-bit little-endian
-			for i := 0; i+1 < n; i += 2 {
-				sample := int16(binary.LittleEndian.Uint16(pOutput[i : i+2]))
-				scaled := int32(float64(sample) * effective)
-				if scaled > 32767 {
-					scaled = 32767
-				} else if scaled < -32768 {
-					scaled = -32768
-				}
-				binary.LittleEndian.PutUint16(pOutput[i:i+2], uint16(scaled))
-			}
-		case 3: // s24: signed 24-bit little-endian
-			for i := 0; i+2 < n; i += 3 {
-				raw := uint32(pOutput[i]) | uint32(pOutput[i+1])<<8 | uint32(pOutput[i+2])<<16
-				if raw&0x800000 != 0 {
-					raw |= 0xFF000000
-				}
-				sample := int32(raw)
-				scaled := int64(float64(sample) * effective)
-				if scaled > 8388607 {
-					scaled = 8388607
-				} else if scaled < -8388608 {
-					scaled = -8388608
-				}
-				v := uint32(scaled)
-				pOutput[i] = byte(v)
-				pOutput[i+1] = byte(v >> 8)
-				pOutput[i+2] = byte(v >> 16)
-			}
-		case 4: // s32: signed 32-bit little-endian
-			for i := 0; i+3 < n; i += 4 {
-				sample := int32(binary.LittleEndian.Uint32(pOutput[i : i+4]))
-				scaled := int64(float64(sample) * effective)
-				if scaled > 2147483647 {
-					scaled = 2147483647
-				} else if scaled < -2147483648 {
-					scaled = -2147483648
-				}
-				binary.LittleEndian.PutUint32(pOutput[i:i+4], uint32(scaled))
-			}
-		}
-	}
 
-	for i := n; i < len(pOutput); i++ {
-		pOutput[i] = 0
-	}
-	if p.pos >= len(p.pcmData) {
-		if p.gen.Load() == gen {
+	// Fast path for unchanged playback state.
+	if !loop && rate == 1.0 && effective == 1.0 {
+		posByte := int(p.positionFrames * float64(p.bytesPerFrame))
+		if posByte >= len(p.pcmData) {
+			for i := 0; i < requestedBytes; i++ {
+				pOutput[i] = 0
+			}
+			if p.gen.Load() == gen {
+				select {
+				case <-p.done:
+				default:
+					close(p.done)
+				}
+			}
+			for i := requestedBytes; i < len(pOutput); i++ {
+				pOutput[i] = 0
+			}
+			return
+		}
+
+		n := copy(pOutput[:requestedBytes], p.pcmData[posByte:])
+		p.positionFrames += float64(n) / float64(p.bytesPerFrame)
+		for i := n; i < requestedBytes; i++ {
+			pOutput[i] = 0
+		}
+		if p.positionFrames >= float64(p.sourceFrames) && p.gen.Load() == gen {
 			select {
 			case <-p.done:
 			default:
 				close(p.done)
 			}
 		}
+		for i := requestedBytes; i < len(pOutput); i++ {
+			pOutput[i] = 0
+		}
+		return
 	}
+
+	framesWritten := 0
+	for i := 0; i < requestedFrames; i++ {
+		for p.positionFrames >= float64(p.sourceFrames) {
+			if !loop {
+				p.positionFrames = float64(p.sourceFrames)
+				break
+			}
+			p.positionFrames -= float64(p.sourceFrames)
+		}
+
+		if !loop && p.positionFrames >= float64(p.sourceFrames) {
+			break
+		}
+
+		baseFrame := int(p.positionFrames)
+		frac := p.positionFrames - float64(baseFrame)
+		nextFrame := baseFrame + 1
+		if nextFrame >= p.sourceFrames {
+			if loop {
+				nextFrame = 0
+			} else {
+				nextFrame = baseFrame
+			}
+		}
+
+		frameBaseOut := i * p.bytesPerFrame
+		for ch := 0; ch < p.numChannels; ch++ {
+			sample0 := readSampleAtFrame(p.pcmData, baseFrame, ch, p.numChannels, p.bytesPerSample)
+			sample1 := sample0
+			if frac > 0 {
+				sample1 = readSampleAtFrame(p.pcmData, nextFrame, ch, p.numChannels, p.bytesPerSample)
+			}
+			sample := sample0*(1-frac) + sample1*frac
+			sample *= effective
+			writeSample(pOutput[frameBaseOut+ch*p.bytesPerSample:frameBaseOut+(ch+1)*p.bytesPerSample], sample, p.bytesPerSample)
+		}
+
+		framesWritten++
+		p.positionFrames += rate
+	}
+
+	for i := framesWritten * p.bytesPerFrame; i < requestedBytes; i++ {
+		pOutput[i] = 0
+	}
+	for i := requestedBytes; i < len(pOutput); i++ {
+		pOutput[i] = 0
+	}
+
+	if !loop && p.positionFrames >= float64(p.sourceFrames) && p.gen.Load() == gen {
+		select {
+		case <-p.done:
+		default:
+			close(p.done)
+		}
+	}
+}
+
+func (p *Player) playbackRateValue() float64 {
+	rate := float64(math.Float32frombits(p.playbackRate.Load()))
+	if rate <= 0 || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		rate = 1.0
+	}
+	return rate
 }
 
 func (p *Player) stopCallback() {
@@ -269,6 +374,76 @@ func (p *Player) stopCallback() {
 	case <-p.done:
 	default:
 		close(p.done)
+	}
+}
+
+func readSampleAtFrame(pcm []byte, frame int, channel int, channels int, bytesPerSample int) float64 {
+	offset := (frame*channels + channel) * bytesPerSample
+	return readSample(pcm, offset, bytesPerSample)
+}
+
+func readSample(pcm []byte, offset int, bytesPerSample int) float64 {
+	if offset < 0 || offset+bytesPerSample > len(pcm) {
+		return 0
+	}
+	switch bytesPerSample {
+	case 1:
+		return float64(int32(int16(pcm[offset])-128)) / 127.0
+	case 2:
+		sample := int16(binary.LittleEndian.Uint16(pcm[offset : offset+2]))
+		return float64(sample) / 32768.0
+	case 3:
+		raw := uint32(pcm[offset]) | uint32(pcm[offset+1])<<8 | uint32(pcm[offset+2])<<16
+		if raw&0x800000 != 0 {
+			raw |= 0xFF000000
+		}
+		sample := int32(raw)
+		return float64(sample) / 8388608.0
+	case 4:
+		sample := int32(binary.LittleEndian.Uint32(pcm[offset : offset+4]))
+		return float64(sample) / 2147483648.0
+	default:
+		return 0
+	}
+}
+
+func writeSample(dst []byte, sample float64, bytesPerSample int) {
+	switch bytesPerSample {
+	case 1:
+		v := int(math.Round(sample*127.0 + 128.0))
+		if v > 255 {
+			v = 255
+		} else if v < 0 {
+			v = 0
+		}
+		dst[0] = byte(v)
+	case 2:
+		s := int64(math.Round(sample * 32767.0))
+		if s > 32767 {
+			s = 32767
+		} else if s < -32768 {
+			s = -32768
+		}
+		binary.LittleEndian.PutUint16(dst[:2], uint16(s))
+	case 3:
+		s := int64(math.Round(sample * 8388607.0))
+		if s > 8388607 {
+			s = 8388607
+		} else if s < -8388608 {
+			s = -8388608
+		}
+		u := uint32(s)
+		dst[0] = byte(u)
+		dst[1] = byte(u >> 8)
+		dst[2] = byte(u >> 16)
+	case 4:
+		s := int64(math.Round(sample * 2147483647.0))
+		if s > 2147483647 {
+			s = 2147483647
+		} else if s < -2147483648 {
+			s = -2147483648
+		}
+		binary.LittleEndian.PutUint32(dst[:4], uint32(s))
 	}
 }
 
@@ -358,6 +533,8 @@ func readFmtChunk(r io.Reader, chunkSize uint32, hdr *wavHeader) error {
 	if err := binary.Read(r, binary.LittleEndian, &blockAlign); err != nil {
 		return err
 	}
+	_ = byteRate
+	_ = blockAlign
 	if err := binary.Read(r, binary.LittleEndian, &hdr.bitsPerSample); err != nil {
 		return err
 	}
@@ -404,4 +581,11 @@ func resolveDeviceID(ctx *malgo.AllocatedContext, kind malgo.DeviceType, hexID s
 		}
 	}
 	return malgo.DeviceID{}, fmt.Errorf("未找到设备ID: %s", hexID)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

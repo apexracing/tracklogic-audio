@@ -148,7 +148,23 @@ func (e *AudioPlayerEngine) PlaySound(name string, deviceID string) (*Player, er
 	if e.ctx == nil {
 		return nil, ErrNotInitialized
 	}
+	return e.playSoundLocked(name, deviceID, false)
+}
 
+// PlayLoop plays a preloaded sound and sets the player into loop mode.
+// This is the same lifecycle as PlaySound, except the Player remains active after
+// each playback pass and never auto-stops for that track.
+func (e *AudioPlayerEngine) PlayLoop(name string, deviceID string) (*Player, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return nil, ErrNotInitialized
+	}
+	return e.playSoundLocked(name, deviceID, true)
+}
+
+// playSoundLocked resolves and replays/creates a Player. Must be called with e.mu held.
+func (e *AudioPlayerEngine) playSoundLocked(name string, deviceID string, looping bool) (*Player, error) {
 	snd, ok := e.sounds[name]
 	if !ok {
 		return nil, fmt.Errorf("未预加载的音效: %s", name)
@@ -157,6 +173,7 @@ func (e *AudioPlayerEngine) PlaySound(name string, deviceID string) (*Player, er
 	key := name + "|" + deviceID
 	p, ok := e.cache[key]
 	if ok {
+		p.SetLoop(looping)
 		return p, p.Replay()
 	}
 
@@ -169,6 +186,7 @@ func (e *AudioPlayerEngine) PlaySound(name string, deviceID string) (*Player, er
 	p.SetVolume(float64(mv))
 	mg := math.Float32frombits(e.masterGain.Load())
 	p.SetGain(float64(mg))
+	p.SetLoop(looping)
 	e.players = append(e.players, p)
 	e.cache[key] = p
 	return p, p.Play()

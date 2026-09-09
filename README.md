@@ -81,6 +81,7 @@ engine.Preload("beep", "beep.wav")           // decode once, cache PCM
 player, _ := engine.PlaySound("beep", "")    // 1st call: init device + play
 <-player.Done()
 player, _ = engine.PlaySound("beep", "")     // subsequent: Replay() — no device init
+player, _ = engine.PlayLoop("engine_idle", "") // 循环播放（用于持续环境音）
 ```
 
 **Key Player methods:**
@@ -88,6 +89,10 @@ player, _ = engine.PlaySound("beep", "")     // subsequent: Replay() — no devi
 - `Stop()` — pause, device stays initialized → can `Play()` again
 - `Reset()` — rewind to beginning
 - `Replay()` — Stop + Reset + Play in one call
+- `SetLoop(enabled)` — 开关循环播放
+- `Loop()` — 当前循环状态
+- `SetPlaybackRate(rate)` — 设置实时播放速率（默认 1.0）
+- `PlaybackRate()` — 当前播放速率
 - `Close()` — stop + uninit device (one-shot players)
 - `Done()` — channel that closes when playback reaches end
 
