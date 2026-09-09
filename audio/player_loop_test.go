@@ -46,8 +46,8 @@ func TestPlayerDataCallbackLoopsAndNonLoopDone(t *testing.T) {
 		bytesPerFrame:  2,
 		sourceFrames:   len(samples),
 	}
-	p.volume.Store(1)
-	p.gain.Store(1)
+	p.volume.Store(math.Float32bits(1.0))
+	p.gain.Store(math.Float32bits(1.0))
 	p.SetLoop(true)
 
 	out := make([]byte, 12) // 6 frames
