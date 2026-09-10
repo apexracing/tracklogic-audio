@@ -78,6 +78,7 @@ Capture output is always mono `float32` PCM. Each `Start` begins a fresh segment
 ```go
 
 engine.Preload("beep", "beep.wav")           // decode once, cache PCM
+engine.PreloadWAV("embedded", reader)         // 从 embed.FS/io.ReadSeeker 解码
 player, _ := engine.PlaySound("beep", "")    // 1st call: init device + play
 <-player.Done()
 player, _ = engine.PlaySound("beep", "")     // subsequent: Replay() — no device init
@@ -95,6 +96,9 @@ player, _ = engine.PlayLoop("engine_idle", "") // 循环播放（用于持续环
 - `PlaybackRate()` — 当前播放速率
 - `Close()` — stop + uninit device (one-shot players)
 - `Done()` — channel that closes when playback reaches end
+
+`ListDevices()` 每次调用都会重新枚举全部播放设备，并返回完整设备 ID、名称及
+`IsDefault` 标识；将返回的 `ID` 传给 `PlaySound`/`PlayLoop` 即可指定输出设备。
 
 ### WAV support
 

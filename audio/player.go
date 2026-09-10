@@ -30,8 +30,18 @@ type wavHeader struct {
 
 // Player plays a WAV sound through an audio output device.
 // Created via AudioPlayerEngine.PlaySound(). Can be replayed via Replay().
+type playbackDevice interface {
+	Start() error
+	Stop() error
+	IsStarted() bool
+	Uninit()
+	PlaybackInternalFormat() malgo.FormatType
+	PlaybackInternalChannels() uint32
+	PlaybackInternalSampleRate() uint32
+}
+
 type Player struct {
-	device *malgo.Device
+	device playbackDevice
 	ctx    *malgo.AllocatedContext
 
 	pcmData []byte
@@ -50,10 +60,11 @@ type Player struct {
 	bytesPerFrame  int
 	sourceFrames   int
 
-	volume atomic.Uint32 // float32 bits, 1.0 = full volume
-	gain   atomic.Uint32 // float32 bits, 1.0 = unity gain, >1.0 amplifies
-	done   chan struct{}
-	mu     sync.Mutex
+	volume   atomic.Uint32 // float32 bits, 1.0 = full volume
+	gain     atomic.Uint32 // float32 bits, 1.0 = unity gain, >1.0 amplifies
+	done     chan struct{}
+	mu       sync.Mutex // playback state and done channel
+	deviceMu sync.Mutex // device Start/Stop/Uninit; never hold mu while calling malgo
 }
 
 func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, deviceID string) (*Player, error) {
@@ -113,15 +124,15 @@ func newPlayerFromSound(ctx *malgo.AllocatedContext, snd *preloadedSound, device
 
 // Play starts playback from the current position. Non-blocking.
 func (p *Player) Play() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.deviceMu.Lock()
+	defer p.deviceMu.Unlock()
 	return p.device.Start()
 }
 
 // Stop pauses playback. The device stays initialized and can be restarted.
 func (p *Player) Stop() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.deviceMu.Lock()
+	defer p.deviceMu.Unlock()
 	return p.device.Stop()
 }
 
@@ -131,27 +142,44 @@ func (p *Player) Reset() {
 	defer p.mu.Unlock()
 	p.gen.Add(1)
 	p.positionFrames = 0
+	p.closeDoneLocked()
 	p.done = make(chan struct{})
 }
 
 // Replay stops, resets, and starts playback from the beginning.
 func (p *Player) Replay() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.deviceMu.Lock()
+	defer p.deviceMu.Unlock()
 	if p.device.IsStarted() {
 		if err := p.device.Stop(); err != nil {
 			return err
 		}
 	}
+	p.mu.Lock()
 	p.gen.Add(1)
 	p.positionFrames = 0
+	p.closeDoneLocked()
 	p.done = make(chan struct{})
+	p.mu.Unlock()
 	return p.device.Start()
 }
 
 // Done returns a channel that is closed when playback finishes naturally.
 func (p *Player) Done() <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.done
+}
+
+func (p *Player) closeDoneLocked() {
+	if p.done == nil {
+		return
+	}
+	select {
+	case <-p.done:
+	default:
+		close(p.done)
+	}
 }
 
 // DeviceFormat returns the negotiated playback format details.
@@ -247,7 +275,7 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 
 	if p.sourceFrames <= 0 || p.bytesPerFrame == 0 {
 		for i := 0; i < requestedBytes; i++ {
-			pOutput[i] = 0
+			pOutput[i] = silenceByte(p.bytesPerSample)
 		}
 		if p.gen.Load() == gen {
 			select {
@@ -257,7 +285,7 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 			}
 		}
 		for i := requestedBytes; i < len(pOutput); i++ {
-			pOutput[i] = 0
+			pOutput[i] = silenceByte(p.bytesPerSample)
 		}
 		return
 	}
@@ -267,11 +295,11 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 	effective := float64(vol) * float64(gn)
 
 	// Fast path for unchanged playback state.
-	if !loop && rate == 1.0 && effective == 1.0 {
+	if !loop && rate == 1.0 && effective == 1.0 && p.positionFrames == math.Trunc(p.positionFrames) {
 		posByte := int(p.positionFrames * float64(p.bytesPerFrame))
 		if posByte >= len(p.pcmData) {
 			for i := 0; i < requestedBytes; i++ {
-				pOutput[i] = 0
+				pOutput[i] = silenceByte(p.bytesPerSample)
 			}
 			if p.gen.Load() == gen {
 				select {
@@ -281,7 +309,7 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 				}
 			}
 			for i := requestedBytes; i < len(pOutput); i++ {
-				pOutput[i] = 0
+				pOutput[i] = silenceByte(p.bytesPerSample)
 			}
 			return
 		}
@@ -289,7 +317,7 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 		n := copy(pOutput[:requestedBytes], p.pcmData[posByte:])
 		p.positionFrames += float64(n) / float64(p.bytesPerFrame)
 		for i := n; i < requestedBytes; i++ {
-			pOutput[i] = 0
+			pOutput[i] = silenceByte(p.bytesPerSample)
 		}
 		if p.positionFrames >= float64(p.sourceFrames) && p.gen.Load() == gen {
 			select {
@@ -299,7 +327,7 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 			}
 		}
 		for i := requestedBytes; i < len(pOutput); i++ {
-			pOutput[i] = 0
+			pOutput[i] = silenceByte(p.bytesPerSample)
 		}
 		return
 	}
@@ -346,10 +374,10 @@ func (p *Player) dataCallback(pOutput, _ []byte, frameCount uint32) {
 	}
 
 	for i := framesWritten * p.bytesPerFrame; i < requestedBytes; i++ {
-		pOutput[i] = 0
+		pOutput[i] = silenceByte(p.bytesPerSample)
 	}
 	for i := requestedBytes; i < len(pOutput); i++ {
-		pOutput[i] = 0
+		pOutput[i] = silenceByte(p.bytesPerSample)
 	}
 
 	if !loop && p.positionFrames >= float64(p.sourceFrames) && p.gen.Load() == gen {
@@ -370,11 +398,9 @@ func (p *Player) playbackRateValue() float64 {
 }
 
 func (p *Player) stopCallback() {
-	select {
-	case <-p.done:
-	default:
-		close(p.done)
-	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closeDoneLocked()
 }
 
 func readSampleAtFrame(pcm []byte, frame int, channel int, channels int, bytesPerSample int) float64 {
@@ -588,4 +614,11 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func silenceByte(bytesPerSample int) byte {
+	if bytesPerSample == 1 {
+		return 128
+	}
+	return 0
 }

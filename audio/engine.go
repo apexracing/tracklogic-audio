@@ -85,8 +85,10 @@ func (e *AudioPlayerEngine) Destroy() error {
 		_ = recorder.close()
 	}
 	for _, p := range e.players {
+		p.deviceMu.Lock()
 		p.device.Stop()
 		p.device.Uninit()
+		p.deviceMu.Unlock()
 	}
 	e.players = nil
 	e.cache = nil
@@ -130,6 +132,25 @@ func (e *AudioPlayerEngine) Preload(name string, wavPath string) error {
 		return nil // already loaded
 	}
 	snd, err := loadSound(wavPath)
+	if err != nil {
+		return err
+	}
+	e.sounds[name] = snd
+	return nil
+}
+
+// PreloadWAV decodes a WAV stream and caches it under name. The reader is not
+// retained and may be an embedded resource; it must be positioned at the WAV start.
+func (e *AudioPlayerEngine) PreloadWAV(name string, r io.ReadSeeker) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return ErrNotInitialized
+	}
+	if _, ok := e.sounds[name]; ok {
+		return nil
+	}
+	snd, err := loadSoundReader(r)
 	if err != nil {
 		return err
 	}
@@ -261,14 +282,34 @@ func loadSound(wavPath string) (*preloadedSound, error) {
 	}
 	defer file.Close()
 
+	return loadSoundReader(file)
+}
+
+func loadSoundReader(file io.ReadSeeker) (*preloadedSound, error) {
+	if file == nil {
+		return nil, fmt.Errorf("WAV reader is required")
+	}
 	header, err := parseWAVHeader(file)
 	if err != nil {
 		return nil, fmt.Errorf("解析WAV头失败: %w", err)
+	}
+	if _, err := toMalgoFormat(header.bitsPerSample); err != nil {
+		return nil, err
+	}
+	frameBytes := uint32(header.numChannels) * uint32(header.bitsPerSample/8)
+	if frameBytes == 0 || header.dataSize%frameBytes != 0 {
+		return nil, fmt.Errorf("WAV必须包含完整PCM帧")
 	}
 
 	pcmData, err := io.ReadAll(io.LimitReader(file, int64(header.dataSize)))
 	if err != nil {
 		return nil, fmt.Errorf("读取PCM数据失败: %w", err)
+	}
+	if uint32(len(pcmData)) != header.dataSize {
+		return nil, fmt.Errorf("WAV数据不完整: 需要%d字节, 实际%d字节", header.dataSize, len(pcmData))
+	}
+	if header.numChannels == 0 || header.sampleRate == 0 || header.bitsPerSample == 0 || header.dataSize == 0 {
+		return nil, fmt.Errorf("WAV格式无效")
 	}
 
 	return &preloadedSound{
