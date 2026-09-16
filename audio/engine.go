@@ -186,6 +186,27 @@ func (e *AudioPlayerEngine) PlayLoop(name string, deviceID string) (*Player, err
 
 // playSoundLocked resolves and replays/creates a Player. Must be called with e.mu held.
 func (e *AudioPlayerEngine) playSoundLocked(name string, deviceID string, looping bool) (*Player, error) {
+	return e.playSoundWithVolumeLocked(name, deviceID, looping, nil)
+}
+
+// PlayLoopWithVolume prepares the voice volume before playback begins, without
+// changing other voices or the shared engine master volume.
+func (e *AudioPlayerEngine) PlayLoopWithVolume(name, deviceID string, volume float64) (*Player, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return nil, ErrNotInitialized
+	}
+	if math.IsNaN(volume) || volume < 0 {
+		volume = 0
+	}
+	if volume > 1 {
+		volume = 1
+	}
+	return e.playSoundWithVolumeLocked(name, deviceID, true, &volume)
+}
+
+func (e *AudioPlayerEngine) playSoundWithVolumeLocked(name string, deviceID string, looping bool, initialVolume *float64) (*Player, error) {
 	snd, ok := e.sounds[name]
 	if !ok {
 		return nil, fmt.Errorf("未预加载的音效: %s", name)
@@ -194,6 +215,9 @@ func (e *AudioPlayerEngine) playSoundLocked(name string, deviceID string, loopin
 	key := name + "|" + deviceID
 	p, ok := e.cache[key]
 	if ok {
+		if initialVolume != nil {
+			p.SetVolume(*initialVolume)
+		}
 		p.SetLoop(looping)
 		return p, p.Replay()
 	}
@@ -204,6 +228,9 @@ func (e *AudioPlayerEngine) playSoundLocked(name string, deviceID string, loopin
 		return nil, err
 	}
 	mv := math.Float32frombits(e.masterVolume.Load())
+	if initialVolume != nil {
+		mv = float32(*initialVolume)
+	}
 	p.SetVolume(float64(mv))
 	mg := math.Float32frombits(e.masterGain.Load())
 	p.SetGain(float64(mg))

@@ -83,9 +83,13 @@ player, _ := engine.PlaySound("beep", "")    // 1st call: init device + play
 <-player.Done()
 player, _ = engine.PlaySound("beep", "")     // subsequent: Replay() — no device init
 player, _ = engine.PlayLoop("engine_idle", "") // 循环播放（用于持续环境音）
+player, _ = engine.PlayLoopWithVolume("engine_idle", "", 0) // v0.0.8：启动前设置单个循环的初始音量
 ```
 
+`PlayLoopWithVolume` 在新建或重播缓存 Player 之前设置音量，不会创建额外引擎，也不会修改其他声部或引擎主音量。适用于先静音准备多层混音，再分别调整各层音量的场景。
+
 **Key Player methods:**
+
 - `Play()` — start (non-blocking)
 - `Stop()` — pause, device stays initialized → can `Play()` again
 - `Reset()` — rewind to beginning
